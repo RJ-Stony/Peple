@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-run_pipeline.py: Audio feature extraction pipeline with parallelism and lightweight ASR.
+run_pipeline.py: Audio feature extraction pipeline with parallelism and reliable CSV output.
 
 - Voice Activity Detection (VAD)
 - Speaker Diarization
@@ -9,8 +9,12 @@ run_pipeline.py: Audio feature extraction pipeline with parallelism and lightwei
 - Words Per Minute (WPM) calculation
 - Text-based Emotion Analysis
 
-Processes all .wav files under provided directories in parallel using ProcessPoolExecutor.
-Includes worker initializer for heavy model/pipeline loading and per-worker logging.
+Results for each .wav file are saved as rows in an output CSV. This version:
+  • Ensures all emotion score columns are present (fills missing with 0)
+  • Uses a placeholder for empty noun lists ("-")
+  • Writes CSV with UTF-8 BOM to preserve Korean in Excel
+  • Uses a worker initializer to load heavy models once per process
+  • Logs each worker's initialization and per-file start
 """
 import os
 import sys
@@ -22,7 +26,7 @@ from tqdm import tqdm
 import pandas as pd
 import torch
 
-# add project src directory to path
+# add project src directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
@@ -34,23 +38,23 @@ import ASR
 import WPM
 from text_based_emotion_recongition import analyze_text_emotion
 
-# Global placeholder for ASR model size
+# Fixed set of emotion labels to cover all possible classes
+EMOTION_LABELS = ['1 star', '2 stars', '3 stars', '4 stars', '5 stars']
+
+# Global placeholder for whisper model size
 WHISPER_SIZE = None
 
 
 def init_worker(whisper_size: str):
-    """Initializer for each worker: load heavy models/pipelines once."""
+    """Initializer for each worker: loads Whisper and pyannote pipelines once."""
     global WHISPER_SIZE
     WHISPER_SIZE = whisper_size
-    # Import here to avoid module-level overhead
     import whisper
     from pyannote.audio import Pipeline
 
-    # Load Whisper model
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ASR._model = whisper.load_model(whisper_size, device=device)
 
-    # Load pyannote pipelines
     VAD._vad_pipeline = Pipeline.from_pretrained(
         "pyannote/voice-activity-detection", use_auth_token=True
     )
@@ -65,36 +69,41 @@ def init_worker(whisper_size: str):
 
 
 def process_file(wav_path: str) -> dict:
-    # Log start
+    """Process a single WAV file end-to-end and return dict of features."""
     print(f"[Worker {os.getpid()}] processing {wav_path}")
 
     # 1) Load audio
     audio, sr = load_audio(wav_path)
     duration = len(audio) / sr
 
-    # 2) VAD
+    # 2) Voice Activity Detection
     speech_segments = VAD.detect_speech(wav_path)
     speech_duration = sum(e - s for s, e in speech_segments)
     silence_ratio = (duration - speech_duration) / duration
 
-    # 3) Diarization
+    # 3) Speaker Diarization
     annotation = speaker_diarization._diar_pipeline(wav_path)
-    durations = speaker_diarization.diarize(wav_path)
+    durations_dict = speaker_diarization.diarize(wav_path)
 
-    # 4) ASR
-    asr_segs = ASR.transcribe(wav_path)
-    transcript = " ".join(seg.text for seg in asr_segs)
-    segments_str = "|".join(f"{seg.start:.2f}-{seg.end:.2f}:{seg.text}" for seg in asr_segs)
+    # 4) Automatic Speech Recognition
+    asr_segments = ASR.transcribe(wav_path)
+    transcript = " ".join(seg.text for seg in asr_segments)
+    segments_str = "|".join(f"{seg.start:.2f}-{seg.end:.2f}:{seg.text}" for seg in asr_segments)
 
-    # 5) Overlapped Speech
-    overlaps = overlapped_speech.detect_overlap(wav_path)
-    overlap_duration = sum(e - s for s, e in overlaps)
+    # 5) Overlapped Speech Detection
+    overlap_segments = overlapped_speech.detect_overlap(wav_path)
+    overlap_duration = sum(e - s for s, e in overlap_segments)
 
-    # 6) WPM
-    wpm = WPM.compute_wpm(asr_segs, annotation)
+    # 6) Words Per Minute
+    wpm_dict = WPM.compute_wpm(asr_segments, annotation)
 
-    # 7) Emotion
-    emo = analyze_text_emotion(transcript, top_k=3)
+    # 7) Text-based Emotion Analysis
+    emo = analyze_text_emotion(transcript, top_k=5)
+    top_nouns_list = emo.get("top_nouns", [])
+    top_nouns_str = (
+        "|".join(f"{noun}:{cnt}" for noun, cnt in top_nouns_list)
+        if top_nouns_list else "-"
+    )
 
     # Build result row
     row = {
@@ -103,65 +112,98 @@ def process_file(wav_path: str) -> dict:
         "speech_count": len(speech_segments),
         "speech_s": speech_duration,
         "silence_ratio": silence_ratio,
-        "num_speakers": len(durations),
-        "speaker_durations": "|".join(f"{spk}:{dur:.2f}" for spk, dur in durations.items()),
+        "num_speakers": len(durations_dict),
+        "speaker_durations": "|".join(f"{spk}:{dur:.2f}" for spk, dur in durations_dict.items()),
         "transcript": transcript,
         "asr_segments": segments_str,
-        "overlap_count": len(overlaps),
+        "overlap_count": len(overlap_segments),
         "overlap_s": overlap_duration,
         "overlap_ratio": overlap_duration / duration,
-        "wpm": "|".join(f"{spk}:{rate:.1f}" for spk, rate in wpm.items()),
+        "wpm": "|".join(f"{spk}:{rate:.1f}" for spk, rate in wpm_dict.items()),
         "sent_label": emo.get("label", ""),
         "sent_score": emo.get("score", 0.0),
-        "top_nouns": "|".join(f"{n}:{c}" for n, c in emo.get("top_nouns", []))
+        "top_nouns": top_nouns_str,
     }
-    for lbl, sc in emo.get("distribution", {}).items():
-        row[f"emo_{lbl}_sc"] = sc
+
+    # Ensure all emotion columns are present
+    distribution = emo.get("distribution", {})
+    for label in EMOTION_LABELS:
+        key = f"emo_{label.replace(' ', '_')}_score"
+        row[key] = distribution.get(label, 0.0)
+
     return row
 
 
 def collect_paths(dirs: list) -> list:
+    """
+    Collect WAV paths for testing:
+      - direct .wav file
+      - any .wav files in given dir
+      - or fallback to S* subfolders
+    """
     paths = []
     for d in dirs:
-        paths.extend(glob.glob(os.path.join(d, "S*", "*.wav")))
+        if os.path.isfile(d) and d.lower().endswith('.wav'):
+            paths.append(d)
+            continue
+        wavs = glob.glob(os.path.join(d, '*.wav'))
+        if wavs:
+            paths.extend(wavs)
+            continue
+        paths.extend(glob.glob(os.path.join(d, 'S*', '*.wav')))
     return paths
 
 
-def main(args):
-    # Parallel worker initializer
+def main():
+    parser = argparse.ArgumentParser(
+        description="Parallel audio pipeline with robust CSV output"
+    )
+    parser.add_argument(
+        "--dirs", nargs='+', required=True,
+        help="List of files or directories to process"
+    )
+    parser.add_argument(
+        "--output", default="audio_features.csv",
+        help="Output CSV filename"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=os.cpu_count(),
+        help="Number of parallel worker processes"
+    )
+    parser.add_argument(
+        "--whisper-size", choices=["tiny","base","small","medium","large"],
+        default="small",
+        help="Size of Whisper ASR model"
+    )
+    args = parser.parse_args()
+
+    paths = collect_paths(args.dirs)
+    print(f"Found {len(paths)} files; workers={args.workers}, Whisper='{args.whisper_size}'")
+
     executor_kwargs = {
         'max_workers': args.workers,
         'initializer': init_worker,
         'initargs': (args.whisper_size,)
     }
 
-    paths = collect_paths(args.dirs)
-    print(f"Found {len(paths)} files; workers={args.workers}, Whisper='{args.whisper_size}'")
-
-    # Execute in parallel with initializer
     with ProcessPoolExecutor(**executor_kwargs) as executor:
         rows = list(tqdm(
             executor.map(process_file, paths),
             total=len(paths), desc="Processing files"
         ))
 
-    # Save results
     df = pd.DataFrame(rows)
-    df.to_csv(args.output, index=False, quoting=csv.QUOTE_ALL)
+    
+    write_header = not os.path.exists(args.output)
+    df.to_csv(
+        args.output,
+        index=False,
+        quoting=csv.QUOTE_ALL,
+        encoding='utf-8-sig',
+        mode='a',
+        header=write_header
+    )
     print(f"Saved results to {args.output}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Parallel audio feature extraction with worker init and logging"
-    )
-    parser.add_argument("--dirs", nargs="+", required=True,
-                        help="Root directories containing S*/.wav files")
-    parser.add_argument("--output", default="audio_features.csv",
-                        help="Output CSV filename")
-    parser.add_argument("--workers", type=int, default=os.cpu_count(),
-                        help="Number of parallel workers")
-    parser.add_argument("--whisper-size", default="small",
-                        choices=["tiny", "base", "small", "medium", "large"],
-                        help="Whisper model size for ASR")
-    args = parser.parse_args()
-    main(args)
+    main()
